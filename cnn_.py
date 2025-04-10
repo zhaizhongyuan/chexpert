@@ -1,13 +1,13 @@
 import os
 import socket
 import os
-# def find_free_port():
-#     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-#         s.bind(('', 0))
-#         return s.getsockname()[1]
+def find_free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(('', 0))
+        return s.getsockname()[1]
 
-# os.environ["MASTER_PORT"] = str(find_free_port())
-# print(f"[INFO] Using MASTER_PORT={os.environ['MASTER_PORT']}")
+os.environ["MASTER_PORT"] = str(find_free_port())
+print(f"[INFO] Using MASTER_PORT={os.environ['MASTER_PORT']}")
 from os.path import join, splitext
 import json
 from tqdm.notebook import tqdm
@@ -31,11 +31,12 @@ from torchmetrics.classification import MultilabelAccuracy
 from torchvision import transforms
 from torchvision.models import densenet121, DenseNet121_Weights
 
-import pytorch_lightning as pl
-from pytorch_lightning.loggers import WandbLogger
+import lightning.pytorch as pl
+from lightning.pytorch.loggers import WandbLogger
+from lightning.pytorch.callbacks import ModelCheckpoint
 
 class CheXpertDataset(Dataset):
-    def __init__(self, root_dir, transform=None, mode="train"):
+    def __init__(self, root_dir, patient_id_set, transform=None):
         """
         Args:
             root_dir (str): Path to the parent directory containing subdirectories (e.g., 'label_folder').
@@ -54,7 +55,6 @@ class CheXpertDataset(Dataset):
         self.img_paths = []
         self.img_value_exception = 'train/patient32368/study1/view1_frontal.jpg'
         self.transform = transform
-        self.mode = mode
         
         # load a dictionary of image paths and labels
         with open(self.label_path, 'r') as f:
@@ -66,15 +66,17 @@ class CheXpertDataset(Dataset):
             label_list_per_sample = []
             for key, value in label_dict.items():
                 if key == 'path_to_image': # save image paths
-                    if value != self.img_value_exception and splitext(value)[0].split('/')[0] == self.mode:
-                        value = splitext(value)[0] + '.png'
+                    split_values_list = splitext(value)[0].split('/')
+                    patient_id = int(split_values_list[1][7:])
+                    if value != self.img_value_exception and patient_id in patient_id_set:
+                        value = '/'.join(split_values_list) + '.png'
                         for folder in self.img_folders:
                             img_subfolder_path = os.path.join(os.path.join(self.img_path, folder), 'PNG')
                             img_path = os.path.join(img_subfolder_path, value)
                             if os.path.exists(img_path):
                                 self.img_paths.append(img_path)
                     else:
-                        break # so labels for test data will not be saved
+                        break # if img_path is not saved, neither will not its label be saved
                 else: # save label vectors
                     if value is None: 
                         label_list_per_sample.append(0) # if this disease is not mentioned, it is perhaps not present
@@ -82,8 +84,8 @@ class CheXpertDataset(Dataset):
                         label_list_per_sample.append(0) # if radiologist is uncertain, chances of having this disease or being healthy are half half
                     else:
                         label_list_per_sample.append(value) # either having this disease or not
-            if len(label_list_per_sample) > 0: # empty list implies a testing smaple
-                self.labels.append(torch.tensor(label_list_per_sample))
+            if len(label_list_per_sample) > 0: # empty list implies this sample is not up to the requirements
+                self.labels.append(torch.tensor(label_list_per_sample, dtype=torch.long))
             
     def __len__(self):
         return len(self.labels)
@@ -93,8 +95,9 @@ class CheXpertDataset(Dataset):
         img = Image.open(img_path).convert("RGB")  # convert to RGB
         if self.transform:
             img = self.transform(img)
-
+        img = img.to(torch.float32)
         label = self.labels[idx]
+
         return img, label
 
 class LitDenseNetMultiLabel(pl.LightningModule):
@@ -182,15 +185,40 @@ class LitDenseNetMultiLabel(pl.LightningModule):
 class MultiLabelDataModule(pl.LightningDataModule):
     def __init__(self, data_dir, batch_size=32, num_workers=4):
         super().__init__()
-        self.data_dir = data_dir
+        self.root = data_dir
+        self.label_folder = os.path.join(self.root, 'chexbert_labels')
+        self.label_path = os.path.join(self.label_folder, 'findings_fixed.json')
+        self.train_patient_id_set = set()
+        self.test_patient_id_set = set()
+
         self.batch_size = batch_size
         self.num_workers = num_workers
 
         self.transform = DenseNet121_Weights.DEFAULT.transforms()
 
     def setup(self, stage=None):
-        full_dataset = CheXpertDataset(root_dir=self.data_dir, transform=self.transform, mode="train")
-        self.train_set, self.val_set = random_split(full_dataset, [0.8, 0.2])
+        # load a dictionary of image paths and labels
+        with open(self.label_path, 'r') as f:
+            label_data = []
+            for line in f:
+                label_data.append(json.loads(line))
+
+        for label_dict in label_data:
+            split_values_list = splitext(label_dict['path_to_image'])[0].split('/')
+            mode = split_values_list[0] # train or test
+            patient_id = int(split_values_list[1][7:])
+            if mode == 'train':
+                self.train_patient_id_set.add(patient_id)
+            elif mode == 'test':
+                self.test_patient_id_set.add(patient_id)
+        
+        train_patient_id_list = list(self.train_patient_id_set)
+        trainset_idx = np.random.choice(np.arange(len(train_patient_id_list)), int(0.75*len(train_patient_id_list)), replace=False)
+        train_patient_id_set = set([train_patient_id_list[idx] for idx in trainset_idx])
+        val_patient_id_set = self.train_patient_id_set - train_patient_id_set
+
+        self.train_set = CheXpertDataset(root_dir=self.root, patient_id_set=train_patient_id_set, transform=self.transform)
+        self.val_set = CheXpertDataset(root_dir=self.root, patient_id_set=val_patient_id_set, transform=self.transform)
 
     def train_dataloader(self):
         return DataLoader(self.train_set, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
@@ -206,21 +234,30 @@ def main():
     print(f"Current device: {torch.cuda.current_device()}")
     print(f"Device name: {torch.cuda.get_device_name(torch.cuda.current_device())}")
 
+    checkpoint_callback = ModelCheckpoint(
+    dirpath="checkpoints",
+    filename="best-{epoch}-{val_loss:.2f}",
+    monitor="val_loss",
+    mode="min",
+    save_top_k=1,
+    )
+
     wandb_logger = WandbLogger(project="chexpert_multilabel")
+
     trainer = pl.Trainer(
-        max_epochs=1,
+        max_epochs=10,
         accelerator='gpu',
-        devices=8,
+        devices=1,
         # strategy='ddp_spawn',
         precision="16-mixed",
         logger=wandb_logger
     )
-    # print(f"MASTER_PORT={os.environ.get('MASTER_PORT')}", flush=True)
-    # print(f"Trainer strategy: {trainer.strategy}", flush=True)
+    print(f"MASTER_PORT={os.environ.get('MASTER_PORT')}", flush=True)
+    print(f"Trainer strategy: {trainer.strategy}", flush=True)
     print(f"Using {trainer.num_devices} device(s)")
+
     model = LitDenseNetMultiLabel(num_classes=14)
     data = MultiLabelDataModule(data_dir=data_folder)
-    
     trainer.fit(model, data)
 
 if __name__ == "__main__":
