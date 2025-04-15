@@ -84,7 +84,7 @@ class CheXpertDataset(Dataset):
                         label_list_per_sample.append(0) # if radiologist is uncertain, chances of having this disease or being healthy are half half
                     else:
                         label_list_per_sample.append(value) # either having this disease or not
-            if len(label_list_per_sample) > 0: # empty list implies this sample is not up to the requirements
+            if len(label_list_per_sample) > 0: # empty list implies this sample is not from this set of patients
                 self.labels.append(torch.tensor(label_list_per_sample, dtype=torch.long))
             
     def __len__(self):
@@ -101,7 +101,7 @@ class CheXpertDataset(Dataset):
         return img, label
 
 class LitDenseNetMultiLabel(pl.LightningModule):
-    def __init__(self, num_classes, lr=1e-3, weight_decay=1e-5):
+    def __init__(self, num_classes, lr=5e-5, weight_decay=1e-5):
         super().__init__()
         self.save_hyperparameters()
 
@@ -183,7 +183,7 @@ class LitDenseNetMultiLabel(pl.LightningModule):
         return torch.optim.Adam(self.parameters(), lr=self.hparams.lr, weight_decay=self.hparams.weight_decay)
 
 class MultiLabelDataModule(pl.LightningDataModule):
-    def __init__(self, data_dir, batch_size=32, num_workers=4):
+    def __init__(self, data_dir, batch_size=16, num_workers=4):
         super().__init__()
         self.root = data_dir
         self.label_folder = os.path.join(self.root, 'chexbert_labels')
@@ -228,37 +228,32 @@ class MultiLabelDataModule(pl.LightningDataModule):
 
 def main():
     data_folder = '../../../../../../../storage/ice1/shared/bmed6780/mip_group_2/CheXpert Plus'
-    
-    print('Is running...')
-    print(f"CUDA devices available: {torch.cuda.device_count()}")
-    print(f"Current device: {torch.cuda.current_device()}")
-    print(f"Device name: {torch.cuda.get_device_name(torch.cuda.current_device())}")
-
-    checkpoint_callback = ModelCheckpoint(
-    dirpath="checkpoints",
-    filename="best-{epoch}-{val_loss:.2f}",
-    monitor="val_loss",
-    mode="min",
-    save_top_k=1,
-    )
-
-    wandb_logger = WandbLogger(project="chexpert_multilabel")
-
-    trainer = pl.Trainer(
-        max_epochs=10,
-        accelerator='gpu',
-        devices=1,
-        # strategy='ddp_spawn',
-        precision="16-mixed",
-        logger=wandb_logger
-    )
-    print(f"MASTER_PORT={os.environ.get('MASTER_PORT')}", flush=True)
-    print(f"Trainer strategy: {trainer.strategy}", flush=True)
-    print(f"Using {trainer.num_devices} device(s)")
 
     model = LitDenseNetMultiLabel(num_classes=14)
     data = MultiLabelDataModule(data_dir=data_folder)
+
+    checkpoint_callback = ModelCheckpoint(
+        dirpath="checkpoints",
+        filename="lr_5e-5_batch_size_16_best-{epoch}-{val_loss:.2f}",
+        monitor="val_loss",
+        mode="min",
+        save_top_k=1,
+    )
+
+    wandb_logger = WandbLogger(project="chexpert_multilabel", name="lr_5e-5_batch_size_16")
+    # wandb_logger = WandbLogger(project="chexpert_multilabel")
+
+    trainer = pl.Trainer(
+        max_epochs=8,
+        accelerator='gpu',
+        devices='auto',  # or specify a list like devices=[0,1]
+        # strategy='ddp',  # distributed data parallel
+        precision="16-mixed",     # optional mixed precision
+        logger=wandb_logger,
+        callbacks=[checkpoint_callback]
+    )
+
     trainer.fit(model, data)
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
