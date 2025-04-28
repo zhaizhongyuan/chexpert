@@ -38,7 +38,7 @@ import lightning.pytorch as pl
 from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.callbacks import ModelCheckpoint
 
-class CheXpertDataset(Dataset):
+class CheXpertClsDataset(Dataset):
     def __init__(self, root_dir, patient_id_set, transform=None):
         """
         Args:
@@ -70,7 +70,7 @@ class CheXpertDataset(Dataset):
             for key, value in label_dict.items():
                 if key == 'path_to_image': # save image paths
                     split_values_list = splitext(value)[0].split('/')
-                    patient_id = int(split_values_list[1][7:])
+                    patient_id = split_values_list[1][7:]
                     if value != self.img_value_exception and patient_id in patient_id_set:
                         value = '/'.join(split_values_list) + '.png'
                         for folder in self.img_folders:
@@ -103,7 +103,94 @@ class CheXpertDataset(Dataset):
 
         return img, label
 
-class CheXpertDataModule(pl.LightningDataModule):
+class CheXpertGenDataset(Dataset):
+    def __init__(self, root_dir, patient_id_set, transform):
+        """
+        Args:
+            root_dir (str): Path to the parent directory containing subdirectories (e.g., 'label_folder').
+            transform (callable, optional): Optional transform to be applied on an image.
+            mode (str): Either "train" or "valid" to select the correct folder.
+        """
+        self.root = root_dir
+        self.imgs_path = os.path.join(self.root, 'PNG')
+        self.img_folders = [folder for folder in os.listdir(self.imgs_path) if splitext(folder)[1] == '']
+
+        self.label_path = os.path.join(self.root, 'df_chexpert_plus_240401.csv')
+        # load a dataframe of image paths and radiologist report texts
+        self.chexpert_df = pd.read_csv(self.label_path)
+
+        self.patient_id_study_num_set = set()
+        self.patient_id_study_num_list = []
+        self.img_dict = {}
+        self.text_dict = {}
+        self.img_value_exception = 'train/patient32368/study1/view1_frontal.jpg'
+        self.transform = transform
+
+        for idx in tqdm(range(len(self.chexpert_df))):
+            img_value = self.chexpert_df.iloc[idx]['path_to_image']
+            if img_value != self.img_value_exception:
+                img_value_list = splitext(img_value)[0].split('/')
+                for folder in self.img_folders:
+                    img_subfolder_path = os.path.join(os.path.join(self.imgs_path, folder), 'PNG')
+                    img_path_temp = os.path.join(img_subfolder_path, '/'.join(img_value_list) + '.png')
+                    if os.path.exists(img_path_temp):
+                        img_path = img_path_temp
+
+                patient_id = img_value_list[1][7:]
+                study_num = img_value_list[2]
+                if patient_id in patient_id_set:
+                    patient_id_study_num = f'patient{patient_id}/{study_num}'
+                    self.patient_id_study_num_set.add(patient_id_study_num)
+
+                    if patient_id_study_num not in self.img_dict:
+                        # add list of images to the same study of a patient
+                        img_paths_list = [img_path]
+                        self.img_dict[patient_id_study_num] = img_paths_list
+
+                        # add findings and impression texts to a list
+                        section_reports_dict = {}
+                        section_findings = self.chexpert_df.iloc[idx]['section_findings']
+                        if isinstance(section_findings, str) and len(section_findings.split()) >= 2:
+                            section_findings = section_findings.strip().replace('\n', '').replace('..', '.') # strips mostly '\n'
+                            section_findings = '. '.join([s.strip().capitalize() for s in section_findings.split('.')]).strip() # lower caps
+                            section_reports_dict['findings'] = section_findings
+                        else:
+                            section_reports_dict['findings'] = '[NF]'
+                        section_impression = self.chexpert_df.iloc[idx]['section_impression']
+                        if isinstance(section_impression, str) and len(section_impression.split()) >= 2:
+                            section_impression = section_impression.strip().replace('\n', '').replace('..', '.') # strips mostly '\n'
+                            section_impression = '. '.join([s.strip().capitalize() for s in section_impression.split('.')]).strip() # lower caps
+                            section_reports_dict['impression'] = section_impression
+                        else:
+                            section_reports_dict['impression'] = '[NI]'
+                        self.text_dict[patient_id_study_num] = section_reports_dict
+                    else:
+                        self.img_dict[patient_id_study_num].append(img_path)
+        self.patient_id_study_num_list = list(self.patient_id_study_num_set)
+
+    def __len__(self):
+        assert len(self.img_dict) == len(self.text_dict)
+        assert len(self.patient_id_study_num_list) == len(self.img_dict)
+        return len(self.img_dict)
+
+    def __getitem__(self, idx):
+        item = {}
+        # open images and transform to tensor
+        patient_id_study_num = self.patient_id_study_num_list[idx]
+        img_paths = self.img_dict[patient_id_study_num]
+        img_list = []
+        for img_path in img_paths:
+            img = Image.open(img_path).convert("RGB")  # convert to RGB
+            img = self.transform(img)
+            img = img.to(torch.float32)
+            img_list.append(img)
+        img = torch.stack(img_list, dim=0)
+        item['images'] = img
+        item['findings'] = self.text_dict[patient_id_study_num]['findings']
+        item['impression'] = self.text_dict[patient_id_study_num]['impression']
+        return item
+
+class CheXpertClsDataModule(pl.LightningDataModule):
     def __init__(self, data_dir, transform=None, batch_size=16, num_workers=4):
         super().__init__()
         self.root = data_dir
@@ -126,7 +213,7 @@ class CheXpertDataModule(pl.LightningDataModule):
         for label_dict in label_data:
             split_values_list = splitext(label_dict['path_to_image'])[0].split('/')
             mode = split_values_list[0] # train or test
-            patient_id = int(split_values_list[1][7:])
+            patient_id = split_values_list[1][7:]
             if mode == 'train':
                 self.train_patient_id_set.add(patient_id)
             elif mode == 'valid':
@@ -138,11 +225,61 @@ class CheXpertDataModule(pl.LightningDataModule):
             train_patient_id_set = set([train_patient_id_list[idx] for idx in trainset_idx])
             val_patient_id_set = self.train_patient_id_set - train_patient_id_set
 
-            self.train_set = CheXpertDataset(root_dir=self.root, patient_id_set=train_patient_id_set, transform=self.transform)
-            self.val_set = CheXpertDataset(root_dir=self.root, patient_id_set=val_patient_id_set, transform=self.transform)
+            self.train_set = CheXpertClsDataset(root_dir=self.root, patient_id_set=train_patient_id_set, transform=self.transform)
+            self.val_set = CheXpertClsDataset(root_dir=self.root, patient_id_set=val_patient_id_set, transform=self.transform)
 
         if stage == 'test' or stage is None:
-            self.test_set = CheXpertDataset(root_dir=self.root, patient_id_set=self.test_patient_id_set, transform=self.transform)
+            self.test_set = CheXpertClsDataset(root_dir=self.root, patient_id_set=self.test_patient_id_set, transform=self.transform)
+
+    def train_dataloader(self):
+        return DataLoader(self.train_set, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
+
+    def val_dataloader(self):
+        return DataLoader(self.val_set, batch_size=self.batch_size, num_workers=self.num_workers)
+
+    def test_dataloader(self):
+        return DataLoader(self.test_set, batch_size=self.batch_size, num_workers=self.num_workers)
+
+class CheXpertGenDataModule(pl.LightningDataModule):
+    def __init__(self, data_dir, transform=None, batch_size=16, num_workers=4):
+        super().__init__()
+        self.root = data_dir
+        self.label_folder = os.path.join(self.root, 'chexbert_labels')
+        self.label_path = os.path.join(self.label_folder, 'findings_fixed.json')
+        self.train_patient_id_set = set()
+        self.test_patient_id_set = set()
+
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.transform = transform
+
+    def setup(self, stage=None):
+        # load a dictionary of image paths and labels
+        with open(self.label_path, 'r') as f:
+            label_data = []
+            for line in f:
+                label_data.append(json.loads(line))
+
+        for label_dict in label_data:
+            split_values_list = splitext(label_dict['path_to_image'])[0].split('/')
+            mode = split_values_list[0] # train or test
+            patient_id = split_values_list[1][7:]
+            if mode == 'train':
+                self.train_patient_id_set.add(patient_id)
+            elif mode == 'valid':
+                self.test_patient_id_set.add(patient_id)
+        
+        if stage == 'fit' or stage is None:
+            train_patient_id_list = list(self.train_patient_id_set)
+            trainset_idx = np.random.choice(np.arange(len(train_patient_id_list)), int(0.75*len(train_patient_id_list)), replace=False)
+            train_patient_id_set = set([train_patient_id_list[idx] for idx in trainset_idx])
+            val_patient_id_set = self.train_patient_id_set - train_patient_id_set
+
+            self.train_set = CheXpertGenDataset(root_dir=self.root, patient_id_set=train_patient_id_set, transform=self.transform)
+            self.val_set = CheXpertGenDataset(root_dir=self.root, patient_id_set=val_patient_id_set, transform=self.transform)
+
+        if stage == 'test' or stage is None:
+            self.test_set = CheXpertGenDataset(root_dir=self.root, patient_id_set=self.test_patient_id_set, transform=self.transform)
 
     def train_dataloader(self):
         return DataLoader(self.train_set, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
@@ -213,7 +350,6 @@ class CheXpertCNN(pl.LightningModule):
             "preds": preds, 
             "target": y
         }
-
 
     def on_validation_epoch_end(self):
         preds = torch.cat(self.val_preds)
