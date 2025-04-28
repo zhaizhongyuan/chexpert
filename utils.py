@@ -155,14 +155,14 @@ class CheXpertGenDataset(Dataset):
                             section_findings = '. '.join([s.strip().capitalize() for s in section_findings.split('.')]).strip() # lower caps
                             section_reports_dict['findings'] = section_findings
                         else:
-                            section_reports_dict['findings'] = '[NF]'
+                            section_reports_dict['findings'] = ''
                         section_impression = self.chexpert_df.iloc[idx]['section_impression']
                         if isinstance(section_impression, str) and len(section_impression.split()) >= 2:
                             section_impression = section_impression.strip().replace('\n', '').replace('..', '.') # strips mostly '\n'
                             section_impression = '. '.join([s.strip().capitalize() for s in section_impression.split('.')]).strip() # lower caps
                             section_reports_dict['impression'] = section_impression
                         else:
-                            section_reports_dict['impression'] = '[NI]'
+                            section_reports_dict['impression'] = ''
                         self.text_dict[patient_id_study_num] = section_reports_dict
                     else:
                         self.img_dict[patient_id_study_num].append(img_path)
@@ -184,11 +184,30 @@ class CheXpertGenDataset(Dataset):
             img = self.transform(img)
             img = img.to(torch.float32)
             img_list.append(img)
-        img = torch.stack(img_list, dim=0)
-        item['images'] = img
+        item['images'] = img_list # list of img tensors
         item['findings'] = self.text_dict[patient_id_study_num]['findings']
         item['impression'] = self.text_dict[patient_id_study_num]['impression']
         return item
+
+    def collate_fn(self, batch):
+        """
+        batch: list of items returned by __getitem__
+        """
+        # turn list-of-dicts into dict-of-lists
+        batch_dict = {key: [d[key] for d in batch] for key in batch[0]}
+        # stack per-sample
+        images_stacked = [
+            torch.stack(img_list, dim=0)      # => [n_views_i, C, H, W]
+            for img_list in batch_dict['images']
+        ]
+        # pad across the batch dimension (n_views) to the max n_views in this batch
+        padded = torch.nn.utils.rnn.pad_sequence(
+            images_stacked,
+            batch_first=True,    # => [B, max_n_views, C, H, W]
+            padding_value=0.0
+        )
+        batch_dict['images'] = padded
+        return batch_dict
 
 class CheXpertClsDataModule(pl.LightningDataModule):
     def __init__(self, data_dir, transform=None, batch_size=16, num_workers=4):
@@ -282,13 +301,13 @@ class CheXpertGenDataModule(pl.LightningDataModule):
             self.test_set = CheXpertGenDataset(root_dir=self.root, patient_id_set=self.test_patient_id_set, transform=self.transform)
 
     def train_dataloader(self):
-        return DataLoader(self.train_set, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
+        return DataLoader(self.train_set, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers, collate_fn=self.train_set.collate_fn)
 
     def val_dataloader(self):
-        return DataLoader(self.val_set, batch_size=self.batch_size, num_workers=self.num_workers)
+        return DataLoader(self.val_set, batch_size=self.batch_size, num_workers=self.num_workers, collate_fn=self.val_set.collate_fn)
 
     def test_dataloader(self):
-        return DataLoader(self.test_set, batch_size=self.batch_size, num_workers=self.num_workers)
+        return DataLoader(self.test_set, batch_size=self.batch_size, num_workers=self.num_workers, collate_fn=self.test_set.collate_fn)
 
 class CheXpertCNN(pl.LightningModule):
     def __init__(self, num_classes, model, lr=5e-5, weight_decay=1e-5):
