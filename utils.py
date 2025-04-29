@@ -27,6 +27,8 @@ from torch.utils.data import Dataset, DataLoader, random_split
 
 from sklearn.metrics import multilabel_confusion_matrix, roc_curve, auc
 from torchmetrics.classification import MultilabelAccuracy
+from pytorch_grad_cam import GradCAM, HiResCAM, ScoreCAM, GradCAMPlusPlus, AblationCAM, XGradCAM, EigenCAM, FullGrad
+from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
 
 from torchvision import transforms
 from torchvision.models import densenet121, DenseNet121_Weights, resnet152,ResNet152_Weights
@@ -104,7 +106,7 @@ class CheXpertClsDataset(Dataset):
         return img, label
 
 class CheXpertGenDataset(Dataset):
-    def __init__(self, root_dir, patient_id_set, transform):
+    def __init__(self, root_dir, patient_id_set, transform, model, target_layers):
         """
         Args:
             root_dir (str): Path to the parent directory containing subdirectories (e.g., 'label_folder').
@@ -125,6 +127,9 @@ class CheXpertGenDataset(Dataset):
         self.text_dict = {}
         self.img_value_exception = 'train/patient32368/study1/view1_frontal.jpg'
         self.transform = transform
+
+        self.model = model
+        self.target_layers = target_layers
 
         for idx in tqdm(range(len(self.chexpert_df))):
             img_value = self.chexpert_df.iloc[idx]['path_to_image']
@@ -178,13 +183,20 @@ class CheXpertGenDataset(Dataset):
         # open images and transform to tensor
         patient_id_study_num = self.patient_id_study_num_list[idx]
         img_paths = self.img_dict[patient_id_study_num]
-        img_list = []
+        cam_aug_img_list = []
         for img_path in img_paths:
             img = Image.open(img_path).convert("RGB")  # convert to RGB
             img = self.transform(img)
             img = img.to(torch.float32)
-            img_list.append(img)
-        item['images'] = img_list # list of img tensors
+            # cam_aug_list = [img]
+            # for class_idx in range(14):
+            #     targets = [ClassifierOutputTarget(class_idx)]
+            #     with GradCAM(model=self.model, target_layers=self.target_layers) as cam:
+            #         cam_aug_list.append(cam(input_tensor=torch.unsqueeze(img, dim=0), targets=targets))
+            # cam_aug_img = torch.cat(cam_aug_list, dim=0)
+            # cam_aug_img_list.append(cam_aug_img)
+            cam_aug_img_list.append(img)
+        item['images'] = cam_aug_img_list # list of img tensors
         item['findings'] = self.text_dict[patient_id_study_num]['findings']
         item['impression'] = self.text_dict[patient_id_study_num]['impression']
         return item
@@ -260,7 +272,7 @@ class CheXpertClsDataModule(pl.LightningDataModule):
         return DataLoader(self.test_set, batch_size=self.batch_size, num_workers=self.num_workers)
 
 class CheXpertGenDataModule(pl.LightningDataModule):
-    def __init__(self, data_dir, transform=None, batch_size=16, num_workers=4):
+    def __init__(self, data_dir, model, target_layers, transform=None, batch_size=16, num_workers=4):
         super().__init__()
         self.root = data_dir
         self.label_folder = os.path.join(self.root, 'chexbert_labels')
@@ -271,6 +283,9 @@ class CheXpertGenDataModule(pl.LightningDataModule):
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.transform = transform
+
+        self.model = model
+        self.target_layers = target_layers
 
     def setup(self, stage=None):
         # load a dictionary of image paths and labels
