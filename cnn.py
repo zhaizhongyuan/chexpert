@@ -227,7 +227,7 @@ class MultiLabelDataModule(pl.LightningDataModule):
         return DataLoader(self.val_set, batch_size=self.batch_size, num_workers=self.num_workers)
 
 def main():
-    data_folder = '../../../../../../../storage/ice1/shared/bmed6780/mip_group_2/CheXpert Plus'
+    data_folder = 'CheXpert Plus'
 
     model = LitDenseNetMultiLabel(num_classes=14)
     data = MultiLabelDataModule(data_dir=data_folder)
@@ -241,7 +241,6 @@ def main():
     )
 
     wandb_logger = WandbLogger(project="chexpert_multilabel", name="lr_5e-5_batch_size_16")
-    # wandb_logger = WandbLogger(project="chexpert_multilabel")
 
     trainer = pl.Trainer(
         max_epochs=8,
